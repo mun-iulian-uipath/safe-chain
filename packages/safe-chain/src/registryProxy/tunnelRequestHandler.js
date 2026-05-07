@@ -109,15 +109,17 @@ function tunnelRequestToDestination(req, clientSocket, head) {
 
   serverSocket.on("error", (err) => {
     clearTimeout(connectTimer);
-    if (isImds) {
-      ui.writeVerbose(
-        `Safe-chain: error connecting to ${hostname}:${targetPort} - ${err.message}`
-      );
-    } else {
-      ui.writeError(
-        `Safe-chain: error connecting to ${hostname}:${targetPort} - ${err.message}`
-      );
-    }
+    // Tunnel sockets carry arbitrary HTTPS traffic for hosts the
+    // package manager (and any test framework it spawns) talks to. We
+    // never MITM these, so a peer RST or half-closed pipe at teardown
+    // isn't actionable for the safe-chain user - it just looks like
+    // log spam. Keep the diagnostic at verbose, and fall back to
+    // err.code when the message is empty (which happens for several
+    // post-shutdown socket teardown paths in Node).
+    const detail = err.message || /** @type {NodeJS.ErrnoException} */ (err).code || "unknown error";
+    ui.writeVerbose(
+      `Safe-chain: error connecting to ${hostname}:${targetPort} - ${detail}`
+    );
     if (clientSocket.writable) {
       clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
     }
@@ -185,18 +187,23 @@ function tunnelRequestViaProxy(req, clientSocket, head, proxyUrl) {
   });
 
   proxySocket.on("error", (err) => {
+    const detail = err.message || /** @type {NodeJS.ErrnoException} */ (err).code || "unknown error";
     if (!isConnected) {
+      // Failure to reach the upstream system proxy on the way *up* is
+      // a real problem the user can act on, keep this at error level.
       ui.writeError(
         `Safe-chain: error connecting to proxy ${proxy.hostname}:${
           proxy.port || 8080
-        } - ${err.message}`
+        } - ${detail}`
       );
       if (clientSocket.writable) {
         clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
       }
     } else {
-      ui.writeError(
-        `Safe-chain: proxy socket error after connection - ${err.message}`
+      // After the tunnel is established this is just teardown noise on
+      // someone else's HTTPS connection - not actionable for safe-chain.
+      ui.writeVerbose(
+        `Safe-chain: proxy socket error after connection - ${detail}`
       );
       if (clientSocket.writable) {
         clientSocket.end();

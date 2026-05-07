@@ -122,18 +122,43 @@ function startServer(server) {
  */
 function stopServer(server) {
   return new Promise((resolve) => {
-    try {
-      server.close(() => {
-        cleanupCertBundle();
-        resolve();
-      });
-    } catch {
-      resolve();
-    }
-    setTimeout(() => {
+    let settled = false;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
       cleanupCertBundle();
       resolve();
-    }, SERVER_STOP_TIMEOUT_MS);
+    };
+
+    // server.close() stops accepting new connections but does NOT
+    // destroy live ones. With keep-alive in flight (npm uses HTTP
+    // keep-alive aggressively, and any tunneled HTTPS connection
+    // from a test framework holds a live socket) the close callback
+    // never fires until each socket eventually drains, so we'd block
+    // here for the full SERVER_STOP_TIMEOUT_MS. Worse, when the
+    // timeout fires and the bin script calls process.exit(...), all
+    // those sockets are torn down with RST mid-flight, producing
+    // floods of bogus error logs from both ends.
+    //
+    // Actively destroy them so close() can complete promptly and we
+    // exit cleanly instead of via process termination.
+    try {
+      server.close(finish);
+    } catch {
+      finish();
+      return;
+    }
+
+    if (typeof server.closeIdleConnections === "function") {
+      server.closeIdleConnections();
+    }
+    if (typeof server.closeAllConnections === "function") {
+      server.closeAllConnections();
+    }
+
+    setTimeout(finish, SERVER_STOP_TIMEOUT_MS);
   });
 }
 
