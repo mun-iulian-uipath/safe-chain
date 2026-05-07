@@ -9,6 +9,13 @@ import { omitHeaders } from "./http-utils.js";
  * @typedef {import("./interceptors/interceptorBuilder.js").Interceptor} Interceptor
  */
 
+// Cap on per-response buffering for the response-rewrite path. Sized to
+// fit the largest npm metadata documents we observe in practice (the
+// outliers are ~10-25 MB after gunzip) while leaving headroom for
+// concurrent requests on a default-heap Node process. Tuned for the
+// `npm ci` parallelism that previously OOM'd the proxy.
+const MAX_MODIFY_BODY_BYTES = 32 * 1024 * 1024;
+
 /**
  * @param {import("http").IncomingMessage} req
  * @param {import("http").ServerResponse} clientSocket
@@ -201,14 +208,56 @@ function createProxyRequest(hostname, port, req, res, requestHandler) {
     const { statusCode, headers } = proxyRes;
 
     if (requestHandler.modifiesResponse()) {
-      /** @type {Array<any>} */
+      /** @type {Array<Buffer>} */
       let chunks = [];
+      let totalBytes = 0;
+      let passthrough = false;
 
-      proxyRes.on("data", (chunk) => chunks.push(chunk));
+      proxyRes.on("data", (chunk) => {
+        if (passthrough) {
+          res.write(chunk);
+          return;
+        }
+
+        totalBytes += chunk.length;
+
+        if (totalBytes > MAX_MODIFY_BODY_BYTES) {
+          // Rewriting needs the whole body in memory (parse → modify →
+          // re-serialize). For pathological responses (e.g. an npm
+          // metadata document for a very large package) this can blow
+          // the V8 heap, especially with many concurrent requests in
+          // flight during `npm ci`. Above the cap we fall back to a
+          // straight passthrough: the safety check we would have done
+          // is skipped for this single response, but the install keeps
+          // running instead of OOMing the proxy.
+          ui.writeWarning(
+            `Safe-chain: response from ${hostname}${req.url} exceeded ${MAX_MODIFY_BODY_BYTES} bytes; streaming through without modification`
+          );
+          passthrough = true;
+          res.writeHead(statusCode, headers);
+          for (const buffered of chunks) {
+            res.write(buffered);
+          }
+          chunks = [];
+          res.write(chunk);
+          return;
+        }
+
+        chunks.push(chunk);
+      });
 
       proxyRes.on("end", () => {
+        if (passthrough) {
+          res.end();
+          return;
+        }
+
         /** @type {Buffer} */
         let buffer = Buffer.concat(chunks);
+        // Free the per-chunk references early so concat / gunzip /
+        // JSON.parse don't have to share heap with the original chunk
+        // array on top of the already large concated copy.
+        chunks = [];
 
         if (proxyRes.headers["content-encoding"] === "gzip") {
           buffer = gunzipSync(buffer);

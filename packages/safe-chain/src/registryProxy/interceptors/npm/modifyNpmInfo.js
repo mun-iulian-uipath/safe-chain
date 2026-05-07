@@ -53,9 +53,10 @@ export function modifyNpmInfoResponse(body, headers) {
       return body;
     }
 
-    // utf-8 is default encoding for JSON, so we don't check if charset is defined in content-type header
-    const bodyContent = body.toString("utf8");
-    const bodyJson = JSON.parse(bodyContent);
+    // utf-8 is default encoding for JSON, so we don't check if charset is defined in content-type header.
+    // Pass the buffer straight to JSON.parse to avoid keeping a separate
+    // multi-megabyte string variable alive alongside the parsed object.
+    const bodyJson = JSON.parse(body.toString("utf8"));
 
     if (!bodyJson.time || !bodyJson["dist-tags"] || !bodyJson.versions) {
       // Just return the current body if the format is not
