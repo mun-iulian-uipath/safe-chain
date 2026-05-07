@@ -122,8 +122,25 @@ function forwardRequest(req, hostname, port, res, requestHandler) {
     ui.writeVerbose(
       `Safe-chain: Error occurred while proxying request to ${req.url} for ${hostname}: ${err.message}`
     );
-    res.writeHead(502);
-    res.end("Bad Gateway");
+    // The upstream connection can fail at any point, including after
+    // we already started streaming the response back to the client.
+    // Writing headers a second time would throw "Cannot write headers
+    // after they are sent", which (via the global uncaughtException
+    // handler) crashes the whole proxy in the middle of the package
+    // manager's run.
+    //
+    // When headers were already sent, end res cleanly (paired with
+    // the chunked-encoding pass through at the writeHead site below)
+    // so npm sees a complete-but-truncated response. pacote then
+    // retries via its EINTEGRITY path. Using destroy(err) instead
+    // would surface as ECONNRESET, which pacote does not retry, so
+    // the install would still fail.
+    if (!res.headersSent) {
+      res.writeHead(502);
+      res.end("Bad Gateway");
+    } else if (!res.writableEnded) {
+      res.end();
+    }
   });
 
   req.on("error", (err) => {
@@ -183,9 +200,41 @@ function createProxyRequest(hostname, port, req, res, requestHandler) {
       ui.writeError(
         `Safe-chain: Error reading upstream response to ${req.url} for ${hostname}: ${err.message}`
       );
+      // For the streaming branch (every tarball), res.writeHead runs
+      // as soon as proxyRes arrives, so headersSent is true by the
+      // time the upstream errors mid-stream. The 502 path is then a
+      // no-op and proxyRes.pipe(res) does NOT propagate 'error' to
+      // res - it only forwards 'end'. Without an explicit cleanup
+      // here, res sits half-open with a partial body and no FIN/RST,
+      // npm waits for more bytes that never come, and 5 minutes
+      // later the install fails with EIDLETIMEOUT (build 11875450).
+      //
+      // We end res cleanly (not destroy/RST) - combined with the
+      // chunked Transfer-Encoding we use for streamed responses
+      // (see the writeHead site below where content-length is
+      // stripped), this surfaces to npm as a complete-but-truncated
+      // response. pacote then computes the integrity over the bytes
+      // that did arrive, sees a sha512 mismatch, and refetches via
+      // its built-in EINTEGRITY retry path. The install completes
+      // even when the upstream registry RSTs a tarball mid-stream.
+      // RSTing res (destroy(err)) would surface as ECONNRESET, which
+      // pacote's tarball stream does NOT treat as retriable, so the
+      // install would still fail.
       if (!res.headersSent) {
         res.writeHead(502);
         res.end("Bad Gateway");
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    });
+
+    proxyRes.on("close", () => {
+      // Some upstream failures emit 'close' without a preceding
+      // 'error' and without a clean 'end'. pipe doesn't catch this
+      // either. Same fix as above: end res cleanly so npm sees a
+      // complete-but-truncated response and can retry on integrity.
+      if (!proxyRes.complete && res.headersSent && !res.writableEnded) {
+        res.end();
       }
     });
 
@@ -229,9 +278,23 @@ function createProxyRequest(hostname, port, req, res, requestHandler) {
         res.end(buffer);
       });
     } else {
-      // If the response is not being modified, we can
-      // just pipe without the need for buffering the output
-      res.writeHead(statusCode, headers);
+      // If the response is not being modified, we can just pipe
+      // without buffering. We strip content-length and
+      // transfer-encoding from the upstream headers so Node's http
+      // server frames our response as chunked. This matters when
+      // upstream errors mid-body: with the original content-length
+      // forwarded, a short body would surface to the client as a
+      // protocol-level abort (which pacote can't retry). Without
+      // content-length, the truncation is invisible at the framing
+      // level - the client sees a clean stream end, computes the
+      // sha512 of what it got, finds a mismatch with the integrity
+      // declared in the metadata, and retries via EINTEGRITY.
+      const forwardHeaders = omitHeaders(
+        headers,
+        ["content-length", "transfer-encoding"],
+        { caseInsensitive: true }
+      ) || {};
+      res.writeHead(statusCode, forwardHeaders);
       proxyRes.pipe(res);
     }
   });
