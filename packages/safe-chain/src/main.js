@@ -29,13 +29,17 @@ export async function main(args) {
   const proxy = createSafeChainProxy();
   await proxy.startServer();
 
-  // Global error handlers to log unhandled errors
+  // Global error handlers to log unhandled errors. Safe-chain proxies
+  // arbitrary HTTPS traffic for the wrapped package manager, so a single
+  // socket-level glitch (peer RST mid-response, half-closed pipe, etc.)
+  // can surface here as an uncaught exception. Tearing down the proxy
+  // process in that case kills the running package manager too, turning
+  // a transient network issue into a hard CI failure. Log and continue
+  // for these; the affected request will already have been failed by the
+  // request-scoped error handler that triggered this.
   process.on("uncaughtException", (error) => {
     ui.writeError(`Safe-chain: Uncaught exception: ${error.message}`);
     ui.writeVerbose(`Stack trace: ${error.stack}`);
-    ui.writeBufferedLogsAndStopBuffering();
-    closeFileLoggerSync();
-    process.exit(1);
   });
 
   process.on("unhandledRejection", (reason) => {
@@ -43,9 +47,6 @@ export async function main(args) {
     if (reason instanceof Error) {
       ui.writeVerbose(`Stack trace: ${reason.stack}`);
     }
-    ui.writeBufferedLogsAndStopBuffering();
-    closeFileLoggerSync();
-    process.exit(1);
   });
 
   try {

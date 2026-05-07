@@ -122,8 +122,17 @@ function forwardRequest(req, hostname, port, res, requestHandler) {
     ui.writeVerbose(
       `Safe-chain: Error occurred while proxying request to ${req.url} for ${hostname}: ${err.message}`
     );
-    res.writeHead(502);
-    res.end("Bad Gateway");
+    // The upstream connection can fail at any point, including after we
+    // already started streaming the response back to the client. Writing
+    // headers a second time would throw "Cannot write headers after they
+    // are sent", which (via the global uncaughtException handler) crashes
+    // the whole proxy in the middle of the package manager's run.
+    if (!res.headersSent) {
+      res.writeHead(502);
+      res.end("Bad Gateway");
+    } else {
+      res.destroy(err);
+    }
   });
 
   req.on("error", (err) => {
@@ -193,8 +202,12 @@ function createProxyRequest(hostname, port, req, res, requestHandler) {
       ui.writeError(
         `Safe-chain: Proxy response missing status code to ${req.url} for ${hostname}`
       );
-      res.writeHead(500);
-      res.end("Internal Server Error");
+      if (!res.headersSent) {
+        res.writeHead(500);
+        res.end("Internal Server Error");
+      } else {
+        res.destroy();
+      }
       return;
     }
 
